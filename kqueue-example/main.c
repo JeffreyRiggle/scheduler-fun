@@ -240,12 +240,9 @@ void process_event(struct kevent evt, int server_fd, struct kevent* change_event
   }
 }
 
-int main() {
-  int server_fd, kqueue_fd;
+int connect_server() {
   struct sockaddr_in server_addr;
-  struct kevent change_event, event_list[32];
-
-  server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (server_fd == -1) {
     fprintf(stderr, "Failed to socket for TCP server\n");
     return -1;
@@ -266,7 +263,6 @@ int main() {
     return -1;
   }
 
-
   int listen_res = listen(server_fd, SOMAXCONN);
   if (listen_res < 0) {
     fprintf(stderr, "Failed to listen on TCP server %d. Closing server socket!\n", listen_res);
@@ -279,6 +275,15 @@ int main() {
     fprintf(stderr, "Failed to set to nonblocking mode. Closing server socket!\n");
     return -1;
   }
+
+  return server_fd;
+}
+
+int main() {
+  int kqueue_fd;
+  struct kevent change_event, event_list[32];
+
+  int server_fd = connect_server();
   printf("Server is listenting on port 3000...\n");
 
   kqueue_fd = kqueue();
