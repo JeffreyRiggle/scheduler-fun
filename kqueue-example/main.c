@@ -1,3 +1,4 @@
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +9,7 @@
 #include <sys/event.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <ctype.h>
 
 const char *get_response = 
   "HTTP/1.1 200 OK\r\n"
@@ -16,6 +18,154 @@ const char *get_response =
   "Connection: close\r\n"
   "\r\n"
   "<html><body><form action=\"file\" method=\"post\"><label for=\"fscript\">Create a script</label><input type=\"text\" name=\"fscript\" required /><input type=\"submit\" value=\"send\"/></form></body></html>";
+
+const char *post_response = 
+  "HTTP/1.1 200 OK\r\n"
+  "Content-Type: text/html; charset=utf-8\r\n"
+  "Content-Length: %d\r\n"
+  "Connection: keep-alive\r\n"
+  "Keep-Alive: timeout=5\r\n"
+  "\r\n"
+  "<html><script>%s</script></html>";
+
+typedef struct {
+  char* method;
+  char* path;
+} http_header_details_t;
+
+typedef struct {
+  int len;
+  char* body;
+} tcp_buf_t;
+
+typedef struct {
+  char* data;
+  int len;
+} script_data_t;
+
+
+http_header_details_t get_header_details(const tcp_buf_t *buf) {
+  int iter = 0;
+  int method_offset = 0;
+  int path_offset = 0;
+  http_header_details_t details;
+
+  while (iter < buf->len) {
+    if (buf->body[iter] == ' ') {
+      if (method_offset == 0) {
+        method_offset = iter;
+        char* method = malloc(method_offset + 1);
+        memcpy(method, buf->body, method_offset);
+        method[method_offset + 1] = '\0';
+        details.method = method;
+      }
+      else if (path_offset == 0) {
+        path_offset = iter;
+        int path_len = path_offset - (method_offset + 1);
+        char* path = malloc(path_len);
+        memcpy(path, buf->body + method_offset + 1, path_len);
+        details.path = path;
+      } else {
+        break;
+      }
+    }
+
+    iter++;
+  }
+
+  return details;
+}
+
+size_t url_decode(char *str) {
+    char *p = str;
+    char *q = str;
+    while (*q) {
+        if (*q == '%') {
+            if (q[1] && q[2] && isxdigit(q[1]) && isxdigit(q[2])) {
+                char hex[3] = {q[1], q[2], '\0'};
+                *p = (char)strtol(hex, NULL, 16);
+                q += 2;
+            }
+        } else if (*q == '+') {
+            *p = ' ';
+        } else {
+            *p = *q;
+        }
+        p++;
+        q++;
+    }
+    *p = '\0';
+
+    return (size_t)(p - str);
+}
+
+script_data_t extract_script(const tcp_buf_t *buf) {
+  script_data_t data;
+  int iter = 0;
+  int script_size = 0;
+  char* script = 0;
+
+  while (iter < buf->len) {
+    if (buf->body[iter] == '\n') {
+      int base_offset = iter + 1;
+      if (strncmp(buf->body + base_offset, "fscript", 7) == 0) {
+        script_size = -7;
+        int innerIter = base_offset;
+        while (innerIter < buf->len) {
+          if (buf->body[innerIter] == '\n' || buf->body[innerIter] == '\0') {
+            break;
+          }
+          script_size++;
+          innerIter++;
+        }
+
+        script = malloc(script_size + 1);
+        memcpy(script, buf->body + base_offset + 8, script_size);
+        script[script_size + 1] = '\0';
+        break;
+      }
+    }
+    iter++;
+  }
+
+  if (script == 0) {
+    // Bad request
+    printf("No script found\n");
+    return data;
+  }
+
+  data.data = script;
+  data.len = script_size;
+
+  data.len = url_decode(data.data);
+  return data;
+}
+
+char* generate_post_response(script_data_t script) {
+  int len = snprintf(NULL, 0, (char *)post_response, script.len + 30, script.data);
+  char* response = malloc(len + 1);
+  snprintf(response, len + 1, (char *)post_response, script.len + 30, script.data);
+
+  return response;
+}
+
+void handle_post_file_request(int client_fd, const tcp_buf_t *buf) {
+  script_data_t script = extract_script(buf);
+  char* res = generate_post_response(script);
+  write(client_fd, res, strlen(res));
+}
+
+bool is_home_page_request(http_header_details_t details) {
+  return strcmp(details.method, "GET") == 0 && strcmp(details.path, "/") == 0;
+}
+
+bool is_post_file_request(http_header_details_t details) {
+  return strcmp(details.method, "POST") == 0 && strcmp(details.path, "/file") == 0;
+}
+
+void handle_home_request(int client) {
+  write(client, get_response, strlen(get_response));
+}
 
 int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -61,13 +211,23 @@ void process_event(struct kevent evt, int server_fd, struct kevent* change_event
   }
 
   if (evt.filter == EVFILT_READ) {
-    char buffer[1024];
-    memset(buffer, 0, 1024);
-    ssize_t bytes_read = read(target_fd, buffer, sizeof(buffer) - 1);
+    char* buffer = malloc(1024);
+    ssize_t bytes_read = read(target_fd, buffer, 1023);
     if (bytes_read > 0) {
-      // TODO actually handle all the same crap as before
-      printf("Got data %s\n", buffer);
-      write(target_fd, get_response, bytes_read);
+      tcp_buf_t tcp_buffer;
+      tcp_buffer.body = buffer;
+      tcp_buffer.len = 1023;
+
+      http_header_details_t header_details = get_header_details(&tcp_buffer);
+      if (is_home_page_request(header_details)) {
+        handle_home_request(target_fd);
+      } else if (is_post_file_request(header_details)) {
+        handle_post_file_request(target_fd, &tcp_buffer);
+      } else {
+        // Unhandled request
+        return;
+      }
+
       return;
     }
 
@@ -80,7 +240,6 @@ void process_event(struct kevent evt, int server_fd, struct kevent* change_event
   }
 }
 
-// TODO make this easier to read
 int main() {
   int server_fd, kqueue_fd;
   struct sockaddr_in server_addr;
