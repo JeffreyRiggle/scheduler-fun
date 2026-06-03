@@ -1,0 +1,7 @@
+c-scheduler-app/main
+**/node_modules/
+
+submission-*.js
+submission-*.js.stats
+
+.DS_STORE
